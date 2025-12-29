@@ -100,7 +100,7 @@ os.makedirs(outputs_folder, exist_ok=True)
 
 
 @torch.no_grad()
-def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
+def worker(start_image, target_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
 
@@ -133,18 +133,29 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
         llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
 
-        # Processing input image
+        # Processing start/target images
 
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Image processing ...'))))
 
-        H, W, C = input_image.shape
+        assert start_image is not None, 'No start image!'
+        if target_image is None:
+            target_image = start_image
+
+        # Choose a single bucket size and crop/resize both images to match.
+        H, W, C = start_image.shape
         height, width = find_nearest_bucket(H, W, resolution=640)
-        input_image_np = resize_and_center_crop(input_image, target_width=width, target_height=height)
 
-        Image.fromarray(input_image_np).save(os.path.join(outputs_folder, f'{job_id}.png'))
+        start_image_np = resize_and_center_crop(start_image, target_width=width, target_height=height)
+        target_image_np = resize_and_center_crop(target_image, target_width=width, target_height=height)
 
-        input_image_pt = torch.from_numpy(input_image_np).float() / 127.5 - 1
-        input_image_pt = input_image_pt.permute(2, 0, 1)[None, :, None]
+        Image.fromarray(start_image_np).save(os.path.join(outputs_folder, f'{job_id}_start.png'))
+        Image.fromarray(target_image_np).save(os.path.join(outputs_folder, f'{job_id}_target.png'))
+
+        start_image_pt = torch.from_numpy(start_image_np).float() / 127.5 - 1
+        start_image_pt = start_image_pt.permute(2, 0, 1)[None, :, None]
+
+        target_image_pt = torch.from_numpy(target_image_np).float() / 127.5 - 1
+        target_image_pt = target_image_pt.permute(2, 0, 1)[None, :, None]
 
         # VAE encoding
 
@@ -153,7 +164,9 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         if not high_vram:
             load_model_as_complete(vae, target_device=gpu)
 
-        start_latent = vae_encode(input_image_pt, vae)
+        start_latent = vae_encode(start_image_pt, vae)
+
+        target_latent = vae_encode(target_image_pt, vae)
 
         # CLIP Vision
 
@@ -162,8 +175,11 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         if not high_vram:
             load_model_as_complete(image_encoder, target_device=gpu)
 
-        image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
-        image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
+        start_image_encoder_output = hf_clip_vision_encode(start_image_np, feature_extractor, image_encoder)
+        start_image_encoder_last_hidden_state = start_image_encoder_output.last_hidden_state
+
+        target_image_encoder_output = hf_clip_vision_encode(target_image_np, feature_extractor, image_encoder)
+        target_image_encoder_last_hidden_state = target_image_encoder_output.last_hidden_state
 
         # Dtype
 
@@ -171,7 +187,8 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         llama_vec_n = llama_vec_n.to(transformer.dtype)
         clip_l_pooler = clip_l_pooler.to(transformer.dtype)
         clip_l_pooler_n = clip_l_pooler_n.to(transformer.dtype)
-        image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(transformer.dtype)
+        start_image_encoder_last_hidden_state = start_image_encoder_last_hidden_state.to(transformer.dtype)
+        target_image_encoder_last_hidden_state = target_image_encoder_last_hidden_state.to(transformer.dtype)
 
         # Sampling
 
@@ -191,6 +208,14 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 return
 
             print(f'section_index = {section_index}, total_latent_sections = {total_latent_sections}')
+
+            # Linearly blend conditioning from start -> target across sections.
+            # alpha = 0 for the first section and alpha = 1 for the last.
+            denom = max(total_latent_sections - 1, 1)
+            alpha = float(section_index) / float(denom)
+
+            current_image_embeddings = (1.0 - alpha) * start_image_encoder_last_hidden_state + alpha * target_image_encoder_last_hidden_state
+            anchor_latent = (1.0 - alpha) * start_latent + alpha * target_latent
 
             if not high_vram:
                 unload_complete_models()
@@ -224,7 +249,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             clean_latent_indices = torch.cat([clean_latent_indices_start, clean_latent_1x_indices], dim=1)
 
             clean_latents_4x, clean_latents_2x, clean_latents_1x = history_latents[:, :, -sum([16, 2, 1]):, :, :].split([16, 2, 1], dim=2)
-            clean_latents = torch.cat([start_latent.to(history_latents), clean_latents_1x], dim=2)
+            clean_latents = torch.cat([anchor_latent.to(history_latents), clean_latents_1x], dim=2)
 
             generated_latents = sample_hunyuan(
                 transformer=transformer,
@@ -246,7 +271,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 negative_prompt_poolers=clip_l_pooler_n,
                 device=gpu,
                 dtype=torch.bfloat16,
-                image_embeddings=image_encoder_last_hidden_state,
+                image_embeddings=current_image_embeddings,
                 latent_indices=latent_indices,
                 clean_latents=clean_latents,
                 clean_latent_indices=clean_latent_indices,
@@ -297,15 +322,15 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
     return
 
 
-def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
+def process(start_image, target_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
     global stream
-    assert input_image is not None, 'No input image!'
+    assert start_image is not None, 'No start image!'
 
     yield None, None, '', '', gr.update(interactive=False), gr.update(interactive=True)
 
     stream = AsyncStream()
 
-    async_run(worker, input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf)
+    async_run(worker, start_image, target_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf)
 
     output_filename = None
 
@@ -342,7 +367,8 @@ with block:
     gr.Markdown('# FramePack-F1')
     with gr.Row():
         with gr.Column():
-            input_image = gr.Image(sources='upload', type="numpy", label="Image", height=320)
+            start_image = gr.Image(sources='upload', type="numpy", label="Start Image", height=240)
+            target_image = gr.Image(sources='upload', type="numpy", label="Target Image (optional)", height=240)
             prompt = gr.Textbox(label="Prompt", value='')
             example_quick_prompts = gr.Dataset(samples=quick_prompts, label='Quick List', samples_per_page=1000, components=[prompt])
             example_quick_prompts.click(lambda x: x[0], inputs=[example_quick_prompts], outputs=prompt, show_progress=False, queue=False)
@@ -377,7 +403,7 @@ with block:
 
     gr.HTML('<div style="text-align:center; margin-top:20px;">Share your results and find ideas at the <a href="https://x.com/search?q=framepack&f=live" target="_blank">FramePack Twitter (X) thread</a></div>')
 
-    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf]
+    ips = [start_image, target_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
     end_button.click(fn=end_process)
 
