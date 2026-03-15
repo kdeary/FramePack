@@ -16,6 +16,8 @@ FramePack can process a very large number of frames with 13B models even on lapt
 
 FramePack can be trained with a much larger batch size, similar to the batch size for image diffusion training.
 
+This version of FramePack is rendering videos at 24fps.
+
 **Video diffusion, but feels like image diffusion.**
 
 # News
@@ -80,6 +82,39 @@ For example, to install sage-attention (linux):
     pip install sageattention==1.0.6
 
 However, you are highly recommended to first try without sage-attention since it will influence results, though the influence is minimal.
+
+To start the GUI, run:
+
+    python demo_gradio.py
+
+Note that it supports `--share`, `--port`, `--server`, and so on.
+
+**macOS**:
+
+FramePack recommends using Python 3.10.  If you have [homebrew](https://brew.sh/) installed, you can install Python 3.10 using brew.
+```bash
+brew install python@3.10
+```
+
+To install dependencies
+```bash
+pip3.10 install --pre torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/nightly/cpu
+pip3.10 install -r requirements.txt
+```
+
+# Starting FramePack on macOS
+To start the GUI, run:
+
+    python3.10 demo_gradio.py
+
+Some additional arguments you can specify are:
+* `--share`: Enable sharing the Gradio interface via a public URL
+* `--server`: Specify the server address (default: '0.0.0.0')
+* `--port`: Specify the port number to run the server on (default: 7860)
+* `--output_dir`: Set the directory for saving generated outputs (default: './outputs')
+
+This version now defaults to 416, but may also be successful with slightly higher resolutions like 480.  Feel free to experiment with the setting.
+(NOTE: The 640 value means it will generate a video that is roughly 640x640 for a square image.  If the image has a different aspect ratio, the resolution will attempt to match the ratio and keep roughly the same number of pixels.)
 
 # GUI
 
