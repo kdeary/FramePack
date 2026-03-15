@@ -123,10 +123,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         or lora_multiplier != previous_lora_multiplier
     )
 
-    # --- FIX: Strict Length Calculation ---
     target_pixel_frames = int(total_second_length * mp4_fps)
-    # Frames added per extension window (standard Hunyuan Video logic)
-    # latent_window_size represents new latents, which translate to (window*4) pixels minus overlap.
     frames_per_extension = latent_window_size * 4 
     total_latent_sections = math.ceil((target_pixel_frames - 1) / frames_per_extension)
     total_latent_sections = int(max(total_latent_sections, 1))
@@ -224,7 +221,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
         for section_index in range(total_latent_sections):
             if stream.input_queue.top() == 'end':
-                raise KeyboardInterrupt('User ends the task.')
+                return
 
             if not high_vram:
                 unload_complete_models()
@@ -242,13 +239,12 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 preview = einops.rearrange(preview, 'b c t h w -> (b h) (t w) c')
 
                 if stream.input_queue.top() == 'end':
-                    raise KeyboardInterrupt('User ends the task.')
+                    raise KeyboardInterrupt('Stop signal.')
 
                 current_step = d['i'] + 1
                 percentage = int(100.0 * current_step / steps)
                 hint = f'Sampling {current_step}/{steps} (Section {section_index+1}/{total_latent_sections})'
                 
-                # Report accurate pixel count
                 px_count = int(max(0, total_generated_latent_frames * 4 - 3))
                 desc = f'Generated: {px_count} frames (~{px_count/fps:.1f}s). Expanding...'
                 stream.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, hint))))
@@ -298,26 +294,20 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             save_bcthw_as_mp4(history_pixels, output_filename, fps=fps, crf=mp4_crf)
             stream.output_queue.push(('file', output_filename))
 
-            # --- FIX: Stop loop if target length reached ---
             current_px_count = int(max(0, total_generated_latent_frames * 4 - 3))
             if current_px_count >= target_pixel_frames:
-                print(f"Target length reached: {current_px_count} frames.")
                 break
 
-    except Exception as e:
-        if "User ends the task" in str(e):
-            print("Worker: Stop signal received.")
-        else:
-            traceback.print_exc()
+    except Exception:
+        traceback.print_exc()
         if not high_vram:
             unload_complete_models(text_encoder, text_encoder_2, image_encoder, vae, transformer)
     finally:
-        # --- FIX: Ensure restart by signaling 'end' always ---
+        # Guarantee termination signal to UI
         stream.output_queue.push(('end', None))
 
 def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_fps, mp4_crf, resolution, lora_file, lora_multiplier, hf_lora_url):
     global stream
-    # Reset UI State
     yield None, None, 'Initializing...', '', gr.update(interactive=False), gr.update(interactive=True)
     
     stream = AsyncStream()
@@ -333,19 +323,17 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
             preview, desc, html = data
             yield gr.update(), gr.update(visible=True, value=preview), desc, html, gr.update(interactive=False), gr.update(interactive=True)
         elif flag == 'end':
-            # --- FIX: Re-enable start button here ---
-            yield output_filename, gr.update(visible=False), "Ready.", '', gr.update(interactive=True), gr.update(interactive=False)
+            yield output_filename, gr.update(visible=False), "Generation Finished or Stopped.", '', gr.update(interactive=True), gr.update(interactive=False)
             break
 
 def end_process():
     stream.input_queue.push('end')
 
-# UI Construction
 quick_prompts = [['The girl dances gracefully, with clear movements, full of charm.'], ['A character doing some simple body movements.']]
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack-F1 (Fixed)')
+    gr.Markdown('# FramePack-F1')
     with gr.Row():
         with gr.Column():
             input_image = gr.Image(sources='upload', type="numpy", label="Image", height=320)
@@ -361,8 +349,8 @@ with block:
             with gr.Accordion("Advanced Settings", open=False):
                 use_teacache = gr.Checkbox(label='Use TeaCache', value=True)
                 n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=False)
-                seed = gr.Number(label="Seed", value=31344444537, precision=0)
-                total_second_length = gr.Slider(label="Total Video Length", minimum=1, maximum=120, value=10, step=0.1)
+                seed = gr.Number(label="Seed", value=31344344537, precision=0)
+                total_second_length = gr.Slider(label="Total Video Length", minimum=1, maximum=120, value=30, step=0.1)
                 latent_window_size = gr.Slider(label="Latent Window", minimum=1, maximum=33, value=9, step=1, visible=False)
                 steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1)
                 cfg = gr.Slider(label="CFG", value=1.0, visible=False)
