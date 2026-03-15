@@ -8,23 +8,20 @@ import gradio as gr
 import torch
 import traceback
 import einops
-import safetensors.torch as sf
 import numpy as np
 import argparse
 import math
 import gc
 import time
-# New import for HF downloading
 from huggingface_hub import hf_hub_download
-
 from PIL import Image
 from diffusers import AutoencoderKLHunyuanVideo
 from transformers import LlamaModel, CLIPTextModel, LlamaTokenizerFast, CLIPTokenizer
 from diffusers_helper.hunyuan import encode_prompt_conds, vae_decode, vae_encode, vae_decode_fake
-from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, soft_append_bcthw, resize_and_center_crop, state_dict_weighted_merge, state_dict_offset_merge, generate_timestamp
+from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, soft_append_bcthw, resize_and_center_crop, generate_timestamp
 from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
 from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
-from diffusers_helper.memory import cpu, gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, fake_diffusers_current_device, DynamicSwapInstaller, unload_complete_models, load_model_as_complete
+from diffusers_helper.memory import gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, fake_diffusers_current_device, DynamicSwapInstaller, unload_complete_models, load_model_as_complete
 from diffusers_helper.thread_utils import AsyncStream, async_run
 from diffusers_helper.gradio.progress_bar import make_progress_bar_css, make_progress_bar_html
 from transformers import SiglipImageProcessor, SiglipVisionModel
@@ -40,13 +37,8 @@ parser.add_argument("--inbrowser", action='store_true')
 parser.add_argument("--output_dir", type=str, default='./outputs')
 args = parser.parse_args()
 
-print(args)
-
 free_mem_gb = get_cuda_free_memory_gb(gpu)
 high_vram = False
-
-print(f'Free VRAM {free_mem_gb} GB')
-print(f'High-VRAM Mode: {high_vram}')
 
 # Model loading
 text_encoder = LlamaModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder', torch_dtype=torch.float16).cpu()
@@ -58,7 +50,7 @@ vae = AutoencoderKLHunyuanVideo.from_pretrained("hunyuanvideo-community/HunyuanV
 feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='feature_extractor')
 image_encoder = SiglipVisionModel.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='image_encoder', torch_dtype=torch.float16).cpu()
 
-transformer = None  # load later
+transformer = None
 transformer_dtype = torch.bfloat16
 previous_lora_file = None
 previous_lora_multiplier = None
@@ -95,17 +87,11 @@ outputs_folder = args.output_dir
 os.makedirs(outputs_folder, exist_ok=True)
 
 def download_lora_from_hf(repo_id_or_url):
-    """Helper to download LoRA from Hugging Face."""
     try:
         if not repo_id_or_url or not repo_id_or_url.strip():
             return None
-        
-        # Clean up URL to get repo ID and filename if possible
-        # Expected format: repo_id/filename.safetensors or just repo_id
         path_parts = repo_id_or_url.replace("https://huggingface.co/", "").strip("/").split("/")
-        
         if "blob" in path_parts or "resolve" in path_parts:
-            # Handle direct file URLs
             repo_id = f"{path_parts[0]}/{path_parts[1]}"
             filename = path_parts[-1]
         elif len(path_parts) >= 2:
@@ -113,7 +99,6 @@ def download_lora_from_hf(repo_id_or_url):
             filename = path_parts[2] if len(path_parts) > 2 else None
         else:
             return None
-
         print(f"Downloading LoRA from {repo_id}...")
         downloaded_path = hf_hub_download(repo_id=repo_id, filename=filename)
         return downloaded_path
@@ -125,7 +110,7 @@ def download_lora_from_hf(repo_id_or_url):
 def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_fps, mp4_crf, resolution, lora_file, lora_multiplier, hf_lora_url):
     global transformer, previous_lora_file, previous_lora_multiplier
 
-    # Decide which LoRA file to use (URL takes priority if provided)
+    # Decide which LoRA file to use
     active_lora = lora_file
     if hf_lora_url and hf_lora_url.strip():
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Downloading LoRA from Hugging Face ...'))))
@@ -138,8 +123,14 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         or lora_multiplier != previous_lora_multiplier
     )
 
-    total_latent_sections = (total_second_length * 24) / (latent_window_size * 4)
-    total_latent_sections = int(max(round(total_latent_sections), 1))
+    # --- FIX: Strict Length Calculation ---
+    target_pixel_frames = int(total_second_length * mp4_fps)
+    # Frames added per extension window (standard Hunyuan Video logic)
+    # latent_window_size represents new latents, which translate to (window*4) pixels minus overlap.
+    frames_per_extension = latent_window_size * 4 
+    total_latent_sections = math.ceil((target_pixel_frames - 1) / frames_per_extension)
+    total_latent_sections = int(max(total_latent_sections, 1))
+
     job_id = generate_timestamp()
     fps = mp4_fps
 
@@ -233,8 +224,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
         for section_index in range(total_latent_sections):
             if stream.input_queue.top() == 'end':
-                stream.output_queue.push(('end', None))
-                return
+                raise KeyboardInterrupt('User ends the task.')
 
             if not high_vram:
                 unload_complete_models()
@@ -252,13 +242,15 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 preview = einops.rearrange(preview, 'b c t h w -> (b h) (t w) c')
 
                 if stream.input_queue.top() == 'end':
-                    stream.output_queue.push(('end', None))
                     raise KeyboardInterrupt('User ends the task.')
 
                 current_step = d['i'] + 1
                 percentage = int(100.0 * current_step / steps)
-                hint = f'Sampling {current_step}/{steps}'
-                desc = f'Total frames: {int(max(0, total_generated_latent_frames * 4 - 3))}. Video extended...'
+                hint = f'Sampling {current_step}/{steps} (Section {section_index+1}/{total_latent_sections})'
+                
+                # Report accurate pixel count
+                px_count = int(max(0, total_generated_latent_frames * 4 - 3))
+                desc = f'Generated: {px_count} frames (~{px_count/fps:.1f}s). Expanding...'
                 stream.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, hint))))
 
             indices = torch.arange(0, sum([1, 16, 2, 1, latent_window_size])).unsqueeze(0)
@@ -305,30 +297,44 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             output_filename = os.path.join(outputs_folder, f'{job_id}_{total_generated_latent_frames}.mp4')
             save_bcthw_as_mp4(history_pixels, output_filename, fps=fps, crf=mp4_crf)
             stream.output_queue.push(('file', output_filename))
-            
-    except Exception:
-        traceback.print_exc()
+
+            # --- FIX: Stop loop if target length reached ---
+            current_px_count = int(max(0, total_generated_latent_frames * 4 - 3))
+            if current_px_count >= target_pixel_frames:
+                print(f"Target length reached: {current_px_count} frames.")
+                break
+
+    except Exception as e:
+        if "User ends the task" in str(e):
+            print("Worker: Stop signal received.")
+        else:
+            traceback.print_exc()
         if not high_vram:
             unload_complete_models(text_encoder, text_encoder_2, image_encoder, vae, transformer)
-
-    stream.output_queue.push(('end', None))
+    finally:
+        # --- FIX: Ensure restart by signaling 'end' always ---
+        stream.output_queue.push(('end', None))
 
 def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_fps, mp4_crf, resolution, lora_file, lora_multiplier, hf_lora_url):
     global stream
-    yield None, None, '', '', gr.update(interactive=False), gr.update(interactive=True)
+    # Reset UI State
+    yield None, None, 'Initializing...', '', gr.update(interactive=False), gr.update(interactive=True)
+    
     stream = AsyncStream()
     async_run(worker, input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_fps, mp4_crf, resolution, lora_file, lora_multiplier, hf_lora_url)
+    
     output_filename = None
     while True:
         flag, data = stream.output_queue.next()
         if flag == 'file':
             output_filename = data
             yield output_filename, gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True)
-        if flag == 'progress':
+        elif flag == 'progress':
             preview, desc, html = data
             yield gr.update(), gr.update(visible=True, value=preview), desc, html, gr.update(interactive=False), gr.update(interactive=True)
-        if flag == 'end':
-            yield output_filename, gr.update(visible=False), gr.update(), '', gr.update(interactive=True), gr.update(interactive=False)
+        elif flag == 'end':
+            # --- FIX: Re-enable start button here ---
+            yield output_filename, gr.update(visible=False), "Ready.", '', gr.update(interactive=True), gr.update(interactive=False)
             break
 
 def end_process():
@@ -339,7 +345,7 @@ quick_prompts = [['The girl dances gracefully, with clear movements, full of cha
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack-F1')
+    gr.Markdown('# FramePack-F1 (Fixed)')
     with gr.Row():
         with gr.Column():
             input_image = gr.Image(sources='upload', type="numpy", label="Image", height=320)
@@ -349,14 +355,14 @@ with block:
             example_quick_prompts.click(lambda x: x[0], inputs=[example_quick_prompts], outputs=prompt)
 
             with gr.Row():
-                start_button = gr.Button(value="Start Generation")
-                end_button = gr.Button(value="End Generation", interactive=False)
+                start_button = gr.Button(value="Start Generation", variant="primary")
+                end_button = gr.Button(value="End Generation", variant="stop", interactive=False)
 
-            with gr.Group():
+            with gr.Accordion("Advanced Settings", open=False):
                 use_teacache = gr.Checkbox(label='Use TeaCache', value=True)
                 n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=False)
                 seed = gr.Number(label="Seed", value=31344444537, precision=0)
-                total_second_length = gr.Slider(label="Total Video Length", minimum=1, maximum=120, value=30, step=0.1)
+                total_second_length = gr.Slider(label="Total Video Length", minimum=1, maximum=120, value=10, step=0.1)
                 latent_window_size = gr.Slider(label="Latent Window", minimum=1, maximum=33, value=9, step=1, visible=False)
                 steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1)
                 cfg = gr.Slider(label="CFG", value=1.0, visible=False)
@@ -374,8 +380,8 @@ with block:
 
         with gr.Column():
             preview_image = gr.Image(label="Next Latents", height=200, visible=False)
-            result_video = gr.Video(label="Finished Frames", autoplay=True, height=512)
-            progress_desc = gr.Markdown('')
+            result_video = gr.Video(label="Finished Video", autoplay=True, height=512)
+            progress_desc = gr.Markdown('Ready.')
             progress_bar = gr.HTML('')
 
     ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_fps, mp4_crf, resolution, lora_file, lora_multiplier, hf_lora_url]
