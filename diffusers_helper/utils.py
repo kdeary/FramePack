@@ -8,6 +8,7 @@ import einops
 import numpy as np
 import datetime
 import torchvision
+import imageio
 
 import safetensors.torch as sf
 from PIL import Image
@@ -263,21 +264,40 @@ def soft_append_bcthw(history, current, overlap=0):
     return output.to(history)
 
 
-def save_bcthw_as_mp4(x, output_filename, fps=10, crf=0):
-    b, c, t, h, w = x.shape
+def save_bcthw_as_mp4(x, output_path, fps=15, crf=16):
+    """
+    Saves a BCTHW tensor (Batch, Channel, Time, Height, Width) as an MP4 file.
+    Replaces torchvision.io.write_video to avoid dependency errors.
+    """
+    try:
+        # x is expected to be [B, C, T, H, W]
+        # We take the first batch [C, T, H, W]
+        video = x[0] 
+        
+        # Rearrange to [T, H, W, C] which is what imageio/video writers expect
+        video = video.permute(1, 2, 3, 0)
+        
+        # Ensure it's on CPU and converted to uint8 [0, 255]
+        if video.dtype != torch.uint8:
+            video = (video * 255).clamp(0, 255).to(torch.uint8)
+            
+        video_np = video.cpu().numpy()
 
-    per_row = b
-    for p in [6, 5, 4, 3, 2]:
-        if b % p == 0:
-            per_row = p
-            break
-
-    os.makedirs(os.path.dirname(os.path.abspath(os.path.realpath(output_filename))), exist_ok=True)
-    x = torch.clamp(x.float(), -1., 1.) * 127.5 + 127.5
-    x = x.detach().cpu().to(torch.uint8)
-    x = einops.rearrange(x, '(m n) c t h w -> t (m h) (n w) c', n=per_row)
-    torchvision.io.write_video(output_filename, x, fps=fps, video_codec='libx264', options={'crf': str(int(crf))})
-    return x
+        # Using imageio with ffmpeg
+        # quality=10 - crf/2 (approximate mapping) or just use macro_block_size
+        writer = imageio.get_writer(output_path, fps=fps, quality=None, 
+                                   pixelformat='yuv420p', codec='libx264',
+                                   output_params=['-crf', str(int(crf))])
+        
+        for frame in video_np:
+            writer.append_data(frame)
+        writer.close()
+        
+        print(f"Video saved successfully to {output_path}")
+    except Exception as e:
+        print(f"Failed to save video: {e}")
+        # Fallback to a simpler save if ffmpeg params fail
+        imageio.mimsave(output_path, video_np, fps=fps)
 
 
 def save_bcthw_as_png(x, output_filename):
