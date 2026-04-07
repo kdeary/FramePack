@@ -267,37 +267,53 @@ def soft_append_bcthw(history, current, overlap=0):
 def save_bcthw_as_mp4(x, output_path, fps=15, crf=16):
     """
     Saves a BCTHW tensor (Batch, Channel, Time, Height, Width) as an MP4 file.
-    Replaces torchvision.io.write_video to avoid dependency errors.
+    Replaces torchvision.io.write_video using the user's specific processing logic.
     """
     try:
-        # x is expected to be [B, C, T, H, W]
-        # We take the first batch [C, T, H, W]
-        video = x[0] 
-        
-        # Rearrange to [T, H, W, C] which is what imageio/video writers expect
-        video = video.permute(1, 2, 3, 0)
-        
-        # Ensure it's on CPU and converted to uint8 [0, 255]
-        if video.dtype != torch.uint8:
-            video = (video * 255).clamp(0, 255).to(torch.uint8)
-            
-        video_np = video.cpu().numpy()
+        # User provided logic for batch/row calculation
+        b, c, t, h, w = x.shape
+        per_row = b
+        for p in [6, 5, 4, 3, 2]:
+            if b % p == 0:
+                per_row = p
+                break
 
-        # Using imageio with ffmpeg
-        # quality=10 - crf/2 (approximate mapping) or just use macro_block_size
-        writer = imageio.get_writer(output_path, fps=fps, quality=None, 
-                                   pixelformat='yuv420p', codec='libx264',
-                                   output_params=['-crf', str(int(crf))])
+        # User provided logic for directory creation
+        os.makedirs(os.path.dirname(os.path.abspath(os.path.realpath(output_path))), exist_ok=True)
+
+        # User provided logic for normalization and conversion
+        x = torch.clamp(x.float(), -1., 1.) * 127.5 + 127.5
+        x = x.detach().cpu().to(torch.uint8)
+
+        # User provided logic for spatial rearrangement
+        # (m n) c t h w -> t (m h) (n w) c
+        x = einops.rearrange(x, '(m n) c t h w -> t (m h) (n w) c', n=per_row)
+        
+        video_np = x.numpy()
+
+        # Using imageio with ffmpeg to replace torchvision.io.write_video
+        writer = imageio.get_writer(
+            output_path, 
+            fps=fps, 
+            quality=None, 
+            pixelformat='yuv420p', 
+            codec='libx264',
+            output_params=['-crf', str(int(crf))]
+        )
         
         for frame in video_np:
             writer.append_data(frame)
         writer.close()
         
         print(f"Video saved successfully to {output_path}")
+        return x
+        
     except Exception as e:
         print(f"Failed to save video: {e}")
         # Fallback to a simpler save if ffmpeg params fail
-        imageio.mimsave(output_path, video_np, fps=fps)
+        if 'video_np' in locals():
+            imageio.mimsave(output_path, video_np, fps=fps)
+        return None
 
 
 def save_bcthw_as_png(x, output_filename):
