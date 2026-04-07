@@ -15,6 +15,7 @@ import gc
 import time
 from huggingface_hub import hf_hub_download
 import requests
+import threading
 from PIL import Image
 from diffusers import AutoencoderKLHunyuanVideo
 from transformers import LlamaModel, CLIPTextModel, LlamaTokenizerFast, CLIPTokenizer
@@ -280,8 +281,10 @@ def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, 
 
         # Sampling Loop (Inverted/Backward Mode for End Frame Support)
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Start sampling ...'))))
-        torch.cuda.empty_cache()
-        gc.collect()
+        
+        if not high_vram:
+            torch.cuda.empty_cache()
+            gc.collect()
 
         rnd = torch.Generator("cpu").manual_seed(seed)
         num_frames = latent_window_size * 4 - 3
@@ -361,7 +364,9 @@ def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, 
             if is_last_section:
                 generated_latents = torch.cat([start_latent.to(generated_latents), generated_latents], dim=2)
 
-            total_generated_latent_frames += int(generated_latents.shape[2])
+            # Update history counts and latents
+            new_latent_frames = int(generated_latents.shape[2])
+            total_generated_latent_frames += new_latent_frames
             history_latents = torch.cat([generated_latents.to(history_latents), history_latents], dim=2)
 
             if not high_vram:
@@ -373,6 +378,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, 
             if history_pixels is None:
                 history_pixels = vae_decode(real_history_latents, vae).cpu()
             else:
+                # Optimized VAE decoding: only decode the newly generated section
                 section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
                 overlapped_frames = latent_window_size * 4 - 3
                 current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae).cpu()
@@ -383,11 +389,17 @@ def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, 
                 torch.cuda.empty_cache()
 
             output_filename = os.path.join(outputs_folder, f'{job_id}_{total_generated_latent_frames}.mp4')
-            save_bcthw_as_mp4(history_pixels, output_filename, fps=mp4_fps, crf=mp4_crf)
-            stream.output_queue.push(('file', output_filename))
+            # Speedup: Save video asynchronously in a background thread
+            def async_save_video(px, path, fps, crf, stream_ptr):
+                save_bcthw_as_mp4(px, path, fps=fps, crf=crf)
+                stream_ptr.output_queue.push(('file', path))
             
-            gc.collect()
-            torch.cuda.empty_cache()
+            save_thread = threading.Thread(target=async_save_video, args=(history_pixels.clone(), output_filename, mp4_fps, mp4_crf, stream))
+            save_thread.start()
+
+            if not high_vram:
+                gc.collect()
+                torch.cuda.empty_cache()
 
             if is_last_section:
                 break
