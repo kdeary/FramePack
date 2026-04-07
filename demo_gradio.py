@@ -30,8 +30,6 @@ from transformers import SiglipImageProcessor, SiglipVisionModel
 from diffusers_helper.clip_vision import hf_clip_vision_encode
 from diffusers_helper.bucket_tools import find_nearest_bucket
 from utils.lora_utils import merge_lora_to_state_dict
-import requests
-from huggingface_hub import hf_hub_download
 
 
 parser = argparse.ArgumentParser()
@@ -103,87 +101,13 @@ stream = AsyncStream()
 outputs_folder = args.output_dir
 os.makedirs(outputs_folder, exist_ok=True)
 
-lora_download_folder = './loras'
-os.makedirs(lora_download_folder, exist_ok=True)
-
-
-def download_lora(url_or_path):
-    if not url_or_path or not url_or_path.strip():
-        return None
-    
-    url_or_path = url_or_path.strip()
-    
-    if os.path.exists(url_or_path):
-        return url_or_path
-    
-    if "huggingface.co" in url_or_path:
-        try:
-            url = url_or_path.replace("https://huggingface.co/", "").strip("/")
-            path_parts = url.split("/")
-            if "blob" in path_parts or "resolve" in path_parts:
-                idx = path_parts.index("blob") if "blob" in path_parts else path_parts.index("resolve")
-                repo_id = f"{path_parts[0]}/{path_parts[1]}"
-                filename = "/".join(path_parts[idx+2:])
-            elif len(path_parts) >= 2:
-                repo_id = f"{path_parts[0]}/{path_parts[1]}"
-                filename = path_parts[2] if len(path_parts) > 2 else None
-            else:
-                return None
-            print(f"Downloading LoRA from HF: {filename} from {repo_id}...")
-            return hf_hub_download(repo_id=repo_id, filename=filename)
-        except Exception as e:
-            print(f"HF Download failed: {e}")
-            return None
-            
-    if url_or_path.startswith("http"):
-        try:
-            filename = url_or_path.split("/")[-1].split("?")[0]
-            if not filename.endswith(".safetensors"):
-                filename += ".safetensors"
-            local_path = os.path.join(lora_download_folder, filename)
-            
-            if os.path.exists(local_path):
-                print(f"Using cached LoRA: {local_path}")
-                return local_path
-            
-            print(f"Downloading LoRA from URL: {url_or_path} ...")
-            response = requests.get(url_or_path, stream=True, timeout=30)
-            response.raise_for_status()
-            with open(local_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            return local_path
-        except Exception as e:
-            print(f"URL Download failed: {e}")
-            return None
-            
-    return None
-
 
 @torch.no_grad()
-def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, resolution, lora_files, lora_links, lora_multiplier):
+def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, resolution, lora_file, lora_multiplier):
     global transformer, previous_lora_file, previous_lora_multiplier
 
-    # Combine all LoRAs
-    active_loras = [] # list of (path, weight)
-    
-    if lora_files:
-        for f in lora_files:
-            active_loras.append((f, lora_multiplier))
-            
-    if lora_links:
-        for line in lora_links.split('\n'):
-            line = line.strip()
-            if not line:
-                continue
-            if ',' in line:
-                parts = line.split(',')
-                active_loras.append((parts[0].strip(), float(parts[1].strip())))
-            else:
-                active_loras.append((line, lora_multiplier))
-
     model_changed = transformer is None or (
-        str(active_loras) != str(previous_lora_file)
+        lora_file != previous_lora_file
         or lora_multiplier != previous_lora_multiplier
     )
 
@@ -241,15 +165,6 @@ def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, 
 
         start_latent = vae_encode(input_image_pt, vae)
 
-        # VAE encoding for end image if provided
-        end_latent = None
-        if end_image is not None:
-            stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'VAE encoding end image ...'))))
-            end_image_np = resize_and_center_crop(end_image, target_width=width, target_height=height)
-            end_image_pt = torch.from_numpy(end_image_np).float() / 127.5 - 1
-            end_image_pt = end_image_pt.permute(2, 0, 1)[None, :, None]
-            end_latent = vae_encode(end_image_pt, vae)
-
         # CLIP Vision
 
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'CLIP Vision encoding ...'))))
@@ -277,7 +192,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, 
             torch.cuda.empty_cache()
             gc.collect()
 
-            previous_lora_file = str(active_loras)
+            previous_lora_file = lora_file
             previous_lora_multiplier = lora_multiplier
 
             transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePackI2V_HY', torch_dtype=torch.bfloat16).cpu()
@@ -288,17 +203,13 @@ def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, 
             transformer.to(dtype=torch.bfloat16)
             transformer.requires_grad_(False)
 
-            if len(active_loras) > 0:
+            if lora_file is not None:
                 state_dict = transformer.state_dict()
-                for lora_path_or_url, multiplier in active_loras:
-                    local_path = download_lora(lora_path_or_url)
-                    if local_path:
-                        print(f"Merging LoRA file {os.path.basename(local_path)} with multiplier {multiplier}...")
-                        state_dict = merge_lora_to_state_dict(state_dict, local_path, multiplier, device=gpu)
-                        gc.collect()
-                
+                print(f"Merging LoRA file {os.path.basename(lora_file)} ...")
+                state_dict = merge_lora_to_state_dict(state_dict, lora_file, lora_multiplier, device=gpu)
+                gc.collect()
                 info = transformer.load_state_dict(state_dict, strict=True, assign=True)
-                print(f"All LoRAs applied: {info}")
+                print(f"LoRA applied: {info}")
 
             if not high_vram:
                 DynamicSwapInstaller.install_model(transformer, device=gpu)
@@ -313,8 +224,6 @@ def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, 
         num_frames = latent_window_size * 4 - 3
 
         history_latents = torch.zeros(size=(1, 16, 1 + 2 + 16, height // 8, width // 8), dtype=torch.float32).cpu()
-        if end_latent is not None:
-            history_latents[:, :, 0, :, :] = end_latent.to(history_latents)
         history_pixels = None
         total_generated_latent_frames = 0
 
@@ -444,7 +353,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, 
     return
 
 
-def process(input_image, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, resolution, lora_files, lora_links, lora_multiplier):
+def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, resolution, lora_file, lora_multiplier):
     global stream
     assert input_image is not None, 'No input image!'
 
@@ -452,7 +361,7 @@ def process(input_image, end_image, prompt, n_prompt, seed, total_second_length,
 
     stream = AsyncStream()
 
-    async_run(worker, input_image, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, resolution, lora_files, lora_links, lora_multiplier)
+    async_run(worker, input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, resolution, lora_file, lora_multiplier)
 
     output_filename = None
 
@@ -489,9 +398,7 @@ with block:
     gr.Markdown('# FramePack')
     with gr.Row():
         with gr.Column():
-            with gr.Row():
-                input_image = gr.Image(sources='upload', type="numpy", label="Start Image", height=320)
-                end_image = gr.Image(sources='upload', type="numpy", label="End Image (Optional)", height=320)
+            input_image = gr.Image(sources='upload', type="numpy", label="Image", height=320)
             resolution = gr.Slider(label="Resolution", minimum=240, maximum=720, value=416, step=16)
             prompt = gr.Textbox(label="Prompt", value='')
             example_quick_prompts = gr.Dataset(samples=quick_prompts, label='Quick List', samples_per_page=1000, components=[prompt])
@@ -521,10 +428,8 @@ with block:
                 mp4_crf = gr.Slider(label="MP4 Compression", minimum=0, maximum=100, value=16, step=1, info="Lower means better quality. 0 is uncompressed. Change to 16 if you get black outputs. ")
 
             with gr.Group():
-                gr.Markdown("### LoRA Settings")
-                lora_links = gr.Textbox(label="LoRA Links / Paths", placeholder="One link or path per line. Optional multiplier: url,0.8", lines=5)
-                lora_files = gr.File(label="Local LoRA Files", file_count="multiple", type="filepath")
-                lora_multiplier = gr.Slider(label="Global LoRA Multiplier", minimum=0.0, maximum=1.0, value=0.8, step=0.1)
+                lora_file = gr.File(label="LoRA File", file_count="single", type="filepath")
+                lora_multiplier = gr.Slider(label="LoRA Multiplier", minimum=0.0, maximum=1.0, value=0.8, step=0.1)
 
         with gr.Column():
             preview_image = gr.Image(label="Next Latents", height=200, visible=False)
@@ -535,7 +440,7 @@ with block:
 
     gr.HTML('<div style="text-align:center; margin-top:20px;">Share your results and find ideas at the <a href="https://x.com/search?q=framepack&f=live" target="_blank">FramePack Twitter (X) thread</a></div>')
 
-    ips = [input_image, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, resolution, lora_files, lora_links, lora_multiplier]
+    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, resolution, lora_file, lora_multiplier]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
     end_button.click(fn=end_process)
 

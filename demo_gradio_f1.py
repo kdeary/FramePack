@@ -14,6 +14,7 @@ import math
 import gc
 import time
 from huggingface_hub import hf_hub_download
+import requests
 from PIL import Image
 from diffusers import AutoencoderKLHunyuanVideo
 from transformers import LlamaModel, CLIPTextModel, LlamaTokenizerFast, CLIPTokenizer
@@ -86,48 +87,78 @@ stream = AsyncStream()
 outputs_folder = args.output_dir
 os.makedirs(outputs_folder, exist_ok=True)
 
-def download_lora_from_hf(repo_id_or_url):
-    try:
-        if not repo_id_or_url or not repo_id_or_url.strip():
-            return None
-        
-        # Clean the URL
-        url = repo_id_or_url.replace("https://huggingface.co/", "").strip("/")
-        path_parts = url.split("/")
-        
-        if "blob" in path_parts or "resolve" in path_parts:
-            # Find the index of 'blob' or 'resolve' to split repo from path
-            idx = path_parts.index("blob") if "blob" in path_parts else path_parts.index("resolve")
-            repo_id = f"{path_parts[0]}/{path_parts[1]}"
-            # Everything after the branch name (path_parts[idx+1]) is the full file path
-            filename = "/".join(path_parts[idx+2:]) 
-        elif len(path_parts) >= 2:
-            repo_id = f"{path_parts[0]}/{path_parts[1]}"
-            filename = path_parts[2] if len(path_parts) > 2 else None
-        else:
-            return None
-            
-        print(f"Downloading LoRA: {filename} from {repo_id}...")
-        downloaded_path = hf_hub_download(repo_id=repo_id, filename=filename)
-        return downloaded_path
-    except Exception as e:
-        print(f"Error downloading LoRA: {e}")
+lora_download_folder = './loras'
+os.makedirs(lora_download_folder, exist_ok=True)
+
+
+def download_lora(url_or_path):
+    if not url_or_path or not url_or_path.strip():
         return None
+    url_or_path = url_or_path.strip()
+    if os.path.exists(url_or_path):
+        return url_or_path
+    if "huggingface.co" in url_or_path:
+        try:
+            url = url_or_path.replace("https://huggingface.co/", "").strip("/")
+            path_parts = url.split("/")
+            if "blob" in path_parts or "resolve" in path_parts:
+                idx = path_parts.index("blob") if "blob" in path_parts else path_parts.index("resolve")
+                repo_id = f"{path_parts[0]}/{path_parts[1]}"
+                filename = "/".join(path_parts[idx+2:])
+            elif len(path_parts) >= 2:
+                repo_id = f"{path_parts[0]}/{path_parts[1]}"
+                filename = path_parts[2] if len(path_parts) > 2 else None
+            else:
+                return None
+            print(f"Downloading LoRA from HF: {filename} from {repo_id}...")
+            return hf_hub_download(repo_id=repo_id, filename=filename)
+        except Exception as e:
+            print(f"HF Download failed: {e}")
+            return None
+    if url_or_path.startswith("http"):
+        try:
+            filename = url_or_path.split("/")[-1].split("?")[0]
+            if not filename.endswith(".safetensors"):
+                filename += ".safetensors"
+            local_path = os.path.join(lora_download_folder, filename)
+            if os.path.exists(local_path):
+                print(f"Using cached LoRA: {local_path}")
+                return local_path
+            print(f"Downloading LoRA from URL: {url_or_path} ...")
+            response = requests.get(url_or_path, stream=True, timeout=30)
+            response.raise_for_status()
+            with open(local_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            return local_path
+        except Exception as e:
+            print(f"URL Download failed: {e}")
+            return None
+    return None
+
 
 @torch.no_grad()
-def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_fps, mp4_crf, resolution, lora_file, lora_multiplier, hf_lora_url):
+def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_fps, mp4_crf, resolution, lora_files, lora_links, lora_multiplier):
     global transformer, previous_lora_file, previous_lora_multiplier
 
-    # Decide which LoRA file to use
-    active_lora = lora_file
-    if hf_lora_url and hf_lora_url.strip():
-        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Downloading LoRA from Hugging Face ...'))))
-        downloaded_lora = download_lora_from_hf(hf_lora_url)
-        if downloaded_lora:
-            active_lora = downloaded_lora
+    # Combine all LoRAs
+    active_loras = []
+    if lora_files:
+        for f in lora_files:
+            active_loras.append((f, lora_multiplier))
+    if lora_links:
+        for line in lora_links.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            if ',' in line:
+                parts = line.split(',')
+                active_loras.append((parts[0].strip(), float(parts[1].strip())))
+            else:
+                active_loras.append((line, lora_multiplier))
 
     model_changed = transformer is None or (
-        active_lora != previous_lora_file
+        str(active_loras) != str(previous_lora_file)
         or lora_multiplier != previous_lora_multiplier
     )
 
@@ -175,6 +206,15 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             load_model_as_complete(vae, target_device=gpu)
         start_latent = vae_encode(input_image_pt, vae)
 
+        # VAE encoding for end image if provided
+        end_latent = None
+        if end_image is not None:
+            stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'VAE encoding end image ...'))))
+            end_image_np = resize_and_center_crop(end_image, target_width=width, target_height=height)
+            end_image_pt = torch.from_numpy(end_image_np).float() / 127.5 - 1
+            end_image_pt = end_image_pt.permute(2, 0, 1)[None, :, None]
+            end_latent = vae_encode(end_image_pt, vae)
+
         # CLIP Vision
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'CLIP Vision encoding ...'))))
         if not high_vram:
@@ -197,39 +237,62 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             torch.cuda.empty_cache()
             gc.collect()
 
-            previous_lora_file = active_lora
-            previous_lora_multiplier = lora_multiplier
-
             transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePack_F1_I2V_HY_20250503', torch_dtype=torch.bfloat16).cpu()
             transformer.eval()
             transformer.high_quality_fp32_output_for_inference = True
             transformer.to(dtype=torch.bfloat16)
             transformer.requires_grad_(False)
 
-            if active_lora is not None:
+            if len(active_loras) > 0:
                 state_dict = transformer.state_dict()
-                print(f"Merging LoRA file {os.path.basename(active_lora)} ...")
-                state_dict = merge_lora_to_state_dict(state_dict, active_lora, lora_multiplier, device=gpu)
-                gc.collect()
+                for lora_path_or_url, multiplier in active_loras:
+                    local_path = download_lora(lora_path_or_url)
+                    if local_path:
+                        print(f"Merging LoRA file {os.path.basename(local_path)} with multiplier {multiplier}...")
+                        state_dict = merge_lora_to_state_dict(state_dict, local_path, multiplier, device=gpu)
+                        gc.collect()
                 info = transformer.load_state_dict(state_dict, strict=True, assign=True)
-                print(f"LoRA applied: {info}")
+                print(f"All LoRAs applied: {info}")
 
+            previous_lora_file = str(active_loras)
+            previous_lora_multiplier = lora_multiplier
             if not high_vram:
                 DynamicSwapInstaller.install_model(transformer, device=gpu)
             else:
                 transformer.to(gpu)
 
-        # Sampling Loop
+        # Sampling Loop (Inverted/Backward Mode for End Frame Support)
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Start sampling ...'))))
         rnd = torch.Generator("cpu").manual_seed(seed)
-        history_latents = torch.zeros(size=(1, 16, 16 + 2 + 1, height // 8, width // 8), dtype=torch.float32).cpu()
-        history_pixels = None
-        history_latents = torch.cat([history_latents, start_latent.to(history_latents)], dim=2)
-        total_generated_latent_frames = 1
+        num_frames = latent_window_size * 4 - 3
 
-        for section_index in range(total_latent_sections):
+        history_latents = torch.zeros(size=(1, 16, 1 + 2 + 16, height // 8, width // 8), dtype=torch.float32).cpu()
+        if end_latent is not None:
+            history_latents[:, :, 0, :, :] = end_latent.to(history_latents)
+        history_pixels = None
+        total_generated_latent_frames = 0
+
+        latent_paddings = reversed(range(total_latent_sections))
+        # Optional: heuristic from demo_gradio.py for smoother sequences
+        if total_latent_sections > 4:
+            latent_paddings = [3] + [2] * (total_latent_sections - 3) + [1, 0]
+
+        for latent_padding in latent_paddings:
+            is_last_section = latent_padding == 0
+            latent_padding_size = latent_padding * latent_window_size
+
             if stream.input_queue.top() == 'end':
                 return
+
+            print(f'latent_padding_size = {latent_padding_size}, is_last_section = {is_last_section}')
+
+            indices = torch.arange(0, sum([1, latent_padding_size, latent_window_size, 1, 2, 16])).unsqueeze(0)
+            clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([1, latent_padding_size, latent_window_size, 1, 2, 16], dim=1)
+            clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
+
+            clean_latents_pre = start_latent.to(history_latents)
+            clean_latents_post, clean_latents_2x, clean_latents_4x = history_latents[:, :, :1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
+            clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
 
             if not high_vram:
                 unload_complete_models()
@@ -251,22 +314,14 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
                 current_step = d['i'] + 1
                 percentage = int(100.0 * current_step / steps)
-                hint = f'Sampling {current_step}/{steps} (Section {section_index+1}/{total_latent_sections})'
-                
+                hint = f'Sampling {current_step}/{steps}'
                 px_count = int(max(0, total_generated_latent_frames * 4 - 3))
-                desc = f'Generated: {px_count} frames (~{px_count/fps:.1f}s). Expanding...'
+                desc = f'Generated: {px_count} frames (~{px_count/mp4_fps:.1f}s). Expanding...'
                 stream.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, hint))))
-
-            indices = torch.arange(0, sum([1, 16, 2, 1, latent_window_size])).unsqueeze(0)
-            clean_latent_indices_start, clean_latent_4x_indices, clean_latent_2x_indices, clean_latent_1x_indices, latent_indices = indices.split([1, 16, 2, 1, latent_window_size], dim=1)
-            clean_latent_indices = torch.cat([clean_latent_indices_start, clean_latent_1x_indices], dim=1)
-
-            clean_latents_4x, clean_latents_2x, clean_latents_1x = history_latents[:, :, -sum([16, 2, 1]):, :, :].split([16, 2, 1], dim=2)
-            clean_latents = torch.cat([start_latent.to(history_latents), clean_latents_1x], dim=2)
 
             generated_latents = sample_hunyuan(
                 transformer=transformer, sampler='unipc', width=width, height=height,
-                frames=latent_window_size * 4 - 3, real_guidance_scale=cfg, distilled_guidance_scale=gs,
+                frames=num_frames, real_guidance_scale=cfg, distilled_guidance_scale=gs,
                 guidance_rescale=rs, num_inference_steps=steps, generator=rnd, prompt_embeds=llama_vec,
                 prompt_embeds_mask=llama_attention_mask, prompt_poolers=clip_l_pooler,
                 negative_prompt_embeds=llama_vec_n, negative_prompt_embeds_mask=llama_attention_mask_n,
@@ -278,29 +333,35 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 callback=callback,
             )
 
+            if is_last_section:
+                generated_latents = torch.cat([start_latent.to(generated_latents), generated_latents], dim=2)
+
             total_generated_latent_frames += int(generated_latents.shape[2])
-            history_latents = torch.cat([history_latents, generated_latents.to(history_latents)], dim=2)
+            history_latents = torch.cat([generated_latents.to(history_latents), history_latents], dim=2)
 
             if not high_vram:
                 offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=8)
                 load_model_as_complete(vae, target_device=gpu)
 
-            real_history_latents = history_latents[:, :, -total_generated_latent_frames:, :, :]
+            real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
 
             if history_pixels is None:
                 history_pixels = vae_decode(real_history_latents, vae).cpu()
             else:
-                section_latent_frames = latent_window_size * 2
+                section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
                 overlapped_frames = latent_window_size * 4 - 3
-                current_pixels = vae_decode(real_history_latents[:, :, -section_latent_frames:], vae).cpu()
-                history_pixels = soft_append_bcthw(history_pixels, current_pixels, overlapped_frames)
+                current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae).cpu()
+                history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
 
             if not high_vram:
                 unload_complete_models()
 
             output_filename = os.path.join(outputs_folder, f'{job_id}_{total_generated_latent_frames}.mp4')
-            save_bcthw_as_mp4(history_pixels, output_filename, fps=fps, crf=mp4_crf)
+            save_bcthw_as_mp4(history_pixels, output_filename, fps=mp4_fps, crf=mp4_crf)
             stream.output_queue.push(('file', output_filename))
+
+            if is_last_section:
+                break
 
             current_px_count = int(max(0, total_generated_latent_frames * 4 - 3))
             if current_px_count >= target_pixel_frames:
@@ -314,12 +375,12 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         # Guarantee termination signal to UI
         stream.output_queue.push(('end', None))
 
-def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_fps, mp4_crf, resolution, lora_file, lora_multiplier, hf_lora_url):
+def process(input_image, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_fps, mp4_crf, resolution, lora_files, lora_links, lora_multiplier):
     global stream
-    yield None, None, 'Initializing...', '', gr.update(interactive=False), gr.update(interactive=True)
-    
+    assert input_image is not None, 'No input image!'
+    yield None, None, '', '', gr.update(interactive=False), gr.update(interactive=True)
     stream = AsyncStream()
-    async_run(worker, input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_fps, mp4_crf, resolution, lora_file, lora_multiplier, hf_lora_url)
+    async_run(worker, input_image, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_fps, mp4_crf, resolution, lora_files, lora_links, lora_multiplier)
     
     output_filename = None
     while True:
@@ -344,7 +405,9 @@ with block:
     gr.Markdown('# FramePack-F1')
     with gr.Row():
         with gr.Column():
-            input_image = gr.Image(sources='upload', type="numpy", label="Image", height=320)
+            with gr.Row():
+                input_image = gr.Image(sources='upload', type="numpy", label="Start Image", height=320)
+                end_image = gr.Image(sources='upload', type="numpy", label="End Image (Optional)", height=320)
             resolution = gr.Slider(label="Resolution", minimum=240, maximum=720, value=416, step=16)
             prompt = gr.Textbox(label="Prompt", value='')
             example_quick_prompts = gr.Dataset(samples=quick_prompts, label='Quick List', components=[prompt])
@@ -370,17 +433,18 @@ with block:
 
             with gr.Group():
                 gr.Markdown("### LoRA Settings")
-                hf_lora_url = gr.Textbox(label="Hugging Face LoRA URL", placeholder="e.g. user/repo/lora.safetensors")
-                lora_file = gr.File(label="Local LoRA File", file_count="single", type="filepath")
-                lora_multiplier = gr.Slider(label="LoRA Multiplier", minimum=0.0, maximum=1.0, value=0.8, step=0.1)
+                lora_links = gr.Textbox(label="LoRA Links / Paths", placeholder="One link or path per line. Optional multiplier: url,0.8", lines=5)
+                lora_files = gr.File(label="Local LoRA Files", file_count="multiple", type="filepath")
+                lora_multiplier = gr.Slider(label="Global LoRA Multiplier", minimum=0.0, maximum=1.0, value=0.8, step=0.1)
 
         with gr.Column():
             preview_image = gr.Image(label="Next Latents", height=200, visible=False)
-            result_video = gr.Video(label="Finished Video", autoplay=True, height=512)
+            result_video = gr.Video(label="Finished Frames", autoplay=True, show_share_button=False, height=512, loop=True)
+            gr.Markdown('Note that the ending actions will be generated before the starting actions due to the inverted sampling. If the starting action is not in the video, you just need to wait, and it will be generated later.')
             progress_desc = gr.Markdown('Ready.')
             progress_bar = gr.HTML('')
 
-    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_fps, mp4_crf, resolution, lora_file, lora_multiplier, hf_lora_url]
+    ips = [input_image, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_fps, mp4_crf, resolution, lora_files, lora_links, lora_multiplier]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
     end_button.click(fn=end_process)
 
