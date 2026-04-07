@@ -97,42 +97,56 @@ def download_lora(url_or_path):
     url_or_path = url_or_path.strip()
     if os.path.exists(url_or_path):
         return url_or_path
+    
     if "huggingface.co" in url_or_path:
         try:
             url = url_or_path.replace("https://huggingface.co/", "").strip("/")
             path_parts = url.split("/")
             if "blob" in path_parts or "resolve" in path_parts:
                 idx = path_parts.index("blob") if "blob" in path_parts else path_parts.index("resolve")
+                # Detect filename and repo_id correctly
+                # Parts before blob/resolve is repo_id, after it is file path
                 repo_id = f"{path_parts[0]}/{path_parts[1]}"
                 filename = "/".join(path_parts[idx+2:])
-            elif len(path_parts) >= 2:
+            elif len(path_parts) >= 3:
                 repo_id = f"{path_parts[0]}/{path_parts[1]}"
-                filename = path_parts[2] if len(path_parts) > 2 else None
+                filename = "/".join(path_parts[2:])
             else:
+                print(f"Malformed HF URL: {url_or_path}")
                 return None
+            
+            # Simple check if it's likely a lora
+            if not filename.endswith(".safetensors"):
+                print(f"Skipping non-safetensors file: {filename}")
+                return None
+                
             print(f"Downloading LoRA from HF: {filename} from {repo_id}...")
             return hf_hub_download(repo_id=repo_id, filename=filename)
         except Exception as e:
             print(f"HF Download failed: {e}")
             return None
+            
     if url_or_path.startswith("http"):
         try:
             filename = url_or_path.split("/")[-1].split("?")[0]
             if not filename.endswith(".safetensors"):
                 filename += ".safetensors"
             local_path = os.path.join(lora_download_folder, filename)
-            if os.path.exists(local_path):
+            if os.path.exists(local_path) and os.path.getsize(local_path) > 1024: # basic size check
                 print(f"Using cached LoRA: {local_path}")
                 return local_path
             print(f"Downloading LoRA from URL: {url_or_path} ...")
-            response = requests.get(url_or_path, stream=True, timeout=30)
+            response = requests.get(url_or_path, stream=True, timeout=60)
             response.raise_for_status()
             with open(local_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
+                    if chunk: 
+                        f.write(chunk)
             return local_path
         except Exception as e:
-            print(f"URL Download failed: {e}")
+            print(f"URL Download failed for {url_or_path}: {e}")
+            if os.path.exists(local_path):
+                os.remove(local_path)
             return None
     return None
 
@@ -151,11 +165,14 @@ def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, 
             line = line.strip()
             if not line:
                 continue
-            if ',' in line:
-                parts = line.split(',')
-                active_loras.append((parts[0].strip(), float(parts[1].strip())))
-            else:
-                active_loras.append((line, lora_multiplier))
+            try:
+                if ',' in line:
+                    parts = line.split(',')
+                    active_loras.append((parts[0].strip(), float(parts[1].strip())))
+                else:
+                    active_loras.append((line, lora_multiplier))
+            except Exception as e:
+                print(f"Skipping malformed LoRA config line '{line}': {e}")
 
     model_changed = transformer is None or (
         str(active_loras) != str(previous_lora_file)
@@ -263,6 +280,9 @@ def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, 
 
         # Sampling Loop (Inverted/Backward Mode for End Frame Support)
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Start sampling ...'))))
+        torch.cuda.empty_cache()
+        gc.collect()
+
         rnd = torch.Generator("cpu").manual_seed(seed)
         num_frames = latent_window_size * 4 - 3
 
@@ -360,10 +380,14 @@ def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, 
 
             if not high_vram:
                 unload_complete_models()
+                torch.cuda.empty_cache()
 
             output_filename = os.path.join(outputs_folder, f'{job_id}_{total_generated_latent_frames}.mp4')
             save_bcthw_as_mp4(history_pixels, output_filename, fps=mp4_fps, crf=mp4_crf)
             stream.output_queue.push(('file', output_filename))
+            
+            gc.collect()
+            torch.cuda.empty_cache()
 
             if is_last_section:
                 break
@@ -387,18 +411,31 @@ def process(input_image, end_image, prompt, n_prompt, seed, total_second_length,
     stream = AsyncStream()
     async_run(worker, input_image, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_fps, mp4_crf, resolution, lora_files, lora_links, lora_multiplier)
     
-    output_filename = None
-    while True:
-        flag, data = stream.output_queue.next()
-        if flag == 'file':
-            output_filename = data
-            yield output_filename, gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True)
-        elif flag == 'progress':
-            preview, desc, html = data
-            yield gr.update(), gr.update(visible=True, value=preview), desc, html, gr.update(interactive=False), gr.update(interactive=True)
-        elif flag == 'end':
-            yield output_filename, gr.update(visible=False), "Generation Finished or Stopped.", '', gr.update(interactive=True), gr.update(interactive=False)
-            break
+    try:
+        output_filename = None
+        while True:
+            if stream is None:
+                break
+            
+            res = stream.output_queue.pop()
+            if res is None:
+                time.sleep(0.01)
+                continue
+            
+            signal, data = res
+            if signal == 'file':
+                output_filename = data
+                yield output_filename, gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+            if signal == 'progress':
+                preview, desc, bar = data
+                yield gr.update(), preview if preview is not None else gr.update(), desc, bar, gr.update(), gr.update()
+            if signal == 'end':
+                break
+    except Exception as e:
+        print(f"UI Loop Error: {e}")
+        traceback.print_exc()
+    finally:
+        yield gr.update(), gr.update(), 'Done.', '', gr.update(interactive=True), gr.update(interactive=False)
 
 def end_process():
     stream.input_queue.push('end')
