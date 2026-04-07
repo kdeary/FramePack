@@ -272,11 +272,12 @@ def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, 
         history_pixels = None
         total_generated_latent_frames = 0
 
-        latent_paddings = reversed(range(total_latent_sections))
+        latent_paddings = list(reversed(range(total_latent_sections)))
         # Optional: heuristic from demo_gradio.py for smoother sequences
         if total_latent_sections > 4:
             latent_paddings = [3] + [2] * (total_latent_sections - 3) + [1, 0]
 
+        is_first_iteration = True
         for latent_padding in latent_paddings:
             is_last_section = latent_padding == 0
             latent_padding_size = latent_padding * latent_window_size
@@ -332,6 +333,10 @@ def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, 
                 clean_latents_4x=clean_latents_4x, clean_latent_4x_indices=clean_latent_4x_indices,
                 callback=callback,
             )
+
+            if is_first_iteration and end_latent is not None:
+                generated_latents = torch.cat([generated_latents, end_latent.to(generated_latents)], dim=2)
+            is_first_iteration = False
 
             if is_last_section:
                 generated_latents = torch.cat([start_latent.to(generated_latents), generated_latents], dim=2)
