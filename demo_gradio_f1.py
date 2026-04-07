@@ -90,16 +90,24 @@ def download_lora_from_hf(repo_id_or_url):
     try:
         if not repo_id_or_url or not repo_id_or_url.strip():
             return None
-        path_parts = repo_id_or_url.replace("https://huggingface.co/", "").strip("/").split("/")
+        
+        # Clean the URL
+        url = repo_id_or_url.replace("https://huggingface.co/", "").strip("/")
+        path_parts = url.split("/")
+        
         if "blob" in path_parts or "resolve" in path_parts:
+            # Find the index of 'blob' or 'resolve' to split repo from path
+            idx = path_parts.index("blob") if "blob" in path_parts else path_parts.index("resolve")
             repo_id = f"{path_parts[0]}/{path_parts[1]}"
-            filename = path_parts[-1]
+            # Everything after the branch name (path_parts[idx+1]) is the full file path
+            filename = "/".join(path_parts[idx+2:]) 
         elif len(path_parts) >= 2:
             repo_id = f"{path_parts[0]}/{path_parts[1]}"
             filename = path_parts[2] if len(path_parts) > 2 else None
         else:
             return None
-        print(f"Downloading LoRA from {repo_id}...")
+            
+        print(f"Downloading LoRA: {filename} from {repo_id}...")
         downloaded_path = hf_hub_download(repo_id=repo_id, filename=filename)
         return downloaded_path
     except Exception as e:
