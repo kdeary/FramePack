@@ -268,7 +268,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, 
 
         history_latents = torch.zeros(size=(1, 16, 1 + 2 + 16, height // 8, width // 8), dtype=torch.float32).cpu()
         if end_latent is not None:
-            history_latents[:, :, 0, :, :] = end_latent.to(history_latents)
+            history_latents[:, :, 0, :, :] = end_latent[:, :, 0, :, :].to(history_latents)
         history_pixels = None
         total_generated_latent_frames = 0
 
