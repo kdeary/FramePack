@@ -13,6 +13,10 @@ import argparse
 import math
 import gc
 import time
+import re
+import shutil
+import tempfile
+import zipfile
 from huggingface_hub import hf_hub_download
 import requests
 import threading
@@ -152,11 +156,55 @@ def download_lora(url_or_path):
     return None
 
 
-@torch.no_grad()
-def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_fps, mp4_crf, resolution, lora_files, lora_links, lora_multiplier):
-    global transformer, previous_lora_file, previous_lora_multiplier
+IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tif', '.tiff')
 
-    # Combine all LoRAs
+
+def natural_sort_key(path):
+    name = os.path.basename(path).lower()
+    return [int(part) if part.isdigit() else part for part in re.split(r'(\d+)', name)]
+
+
+def sanitize_name(name, fallback='image'):
+    stem = os.path.splitext(os.path.basename(name))[0]
+    stem = re.sub(r'[^A-Za-z0-9._-]+', '_', stem).strip('._')
+    return (stem or fallback)[:64]
+
+
+def extract_zip_images(zip_path, dest_dir):
+    """Extract every image in the archive into dest_dir, flattened so archive paths cannot escape it."""
+    extracted = []
+    with zipfile.ZipFile(zip_path) as zf:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            name = info.filename.replace('\\', '/')
+            if name.startswith('__MACOSX/'):
+                continue
+            base = os.path.basename(name)
+            if not base or base.startswith('.') or not base.lower().endswith(IMAGE_EXTENSIONS):
+                continue
+
+            stem, ext = os.path.splitext(base)
+            target = os.path.join(dest_dir, base)
+            counter = 1
+            while os.path.exists(target):
+                target = os.path.join(dest_dir, f'{stem}_{counter}{ext}')
+                counter += 1
+
+            with zf.open(info) as src, open(target, 'wb') as dst:
+                shutil.copyfileobj(src, dst)
+            extracted.append(target)
+
+    extracted.sort(key=natural_sort_key)
+    return extracted
+
+
+def load_image_as_numpy(path):
+    with Image.open(path) as img:
+        return np.array(img.convert('RGB'))
+
+
+def collect_loras(lora_files, lora_links, lora_multiplier):
     active_loras = []
     if lora_files:
         for f in lora_files:
@@ -174,52 +222,117 @@ def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, 
                     active_loras.append((line, lora_multiplier))
             except Exception as e:
                 print(f"Skipping malformed LoRA config line '{line}': {e}")
+    return active_loras
+
+
+def ensure_transformer(active_loras, lora_multiplier):
+    """Loads (or reloads) the transformer only when the LoRA setup changed, so a batch loads it once."""
+    global transformer, previous_lora_file, previous_lora_multiplier
 
     model_changed = transformer is None or (
         str(active_loras) != str(previous_lora_file)
         or lora_multiplier != previous_lora_multiplier
     )
+    if not model_changed:
+        return
+
+    stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Loading transformer ...'))))
+    transformer = None
+    time.sleep(1.0)
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePack_F1_I2V_HY_20250503', torch_dtype=torch.bfloat16).cpu()
+    transformer.eval()
+    transformer.high_quality_fp32_output_for_inference = True
+    transformer.to(dtype=torch.bfloat16)
+    transformer.requires_grad_(False)
+
+    if len(active_loras) > 0:
+        state_dict = transformer.state_dict()
+        for lora_path_or_url, multiplier in active_loras:
+            local_path = download_lora(lora_path_or_url)
+            if local_path:
+                print(f"Merging LoRA file {os.path.basename(local_path)} with multiplier {multiplier}...")
+                state_dict = merge_lora_to_state_dict(state_dict, local_path, multiplier, device=gpu)
+                gc.collect()
+        info = transformer.load_state_dict(state_dict, strict=True, assign=True)
+        print(f"All LoRAs applied: {info}")
+
+    previous_lora_file = str(active_loras)
+    previous_lora_multiplier = lora_multiplier
+    if not high_vram:
+        DynamicSwapInstaller.install_model(transformer, device=gpu)
+    else:
+        transformer.to(gpu)
+
+
+@torch.no_grad()
+def encode_text(prompt, n_prompt, cfg):
+    """Encodes the prompt once; a batch reuses the result for every image."""
+    stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Text encoding ...'))))
+    if not high_vram:
+        fake_diffusers_current_device(text_encoder, gpu)
+        load_model_as_complete(text_encoder_2, target_device=gpu)
+
+    llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+    if cfg == 1:
+        llama_vec_n, clip_l_pooler_n = torch.zeros_like(llama_vec), torch.zeros_like(clip_l_pooler)
+    else:
+        llama_vec_n, clip_l_pooler_n = encode_prompt_conds(n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+
+    llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
+    llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
+
+    return dict(
+        llama_vec=llama_vec.to(transformer_dtype),
+        llama_attention_mask=llama_attention_mask,
+        clip_l_pooler=clip_l_pooler.to(transformer_dtype),
+        llama_vec_n=llama_vec_n.to(transformer_dtype),
+        llama_attention_mask_n=llama_attention_mask_n,
+        clip_l_pooler_n=clip_l_pooler_n.to(transformer_dtype),
+    )
+
+
+@torch.no_grad()
+def generate_video(input_image, end_image, text_cond, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_fps, mp4_crf, resolution, job_id, bulk_mode=False, item_desc=''):
+    """Generates a single video. Returns 'ok', 'aborted' or 'error'."""
+    llama_vec = text_cond['llama_vec']
+    llama_attention_mask = text_cond['llama_attention_mask']
+    clip_l_pooler = text_cond['clip_l_pooler']
+    llama_vec_n = text_cond['llama_vec_n']
+    llama_attention_mask_n = text_cond['llama_attention_mask_n']
+    clip_l_pooler_n = text_cond['clip_l_pooler_n']
+
+    def desc_with(body=''):
+        if item_desc and body:
+            return f'{item_desc}  \n{body}'  # two trailing spaces = markdown hard break
+        return item_desc or body
 
     target_pixel_frames = int(total_second_length * mp4_fps)
-    frames_per_extension = latent_window_size * 4 
+    frames_per_extension = latent_window_size * 4
     total_latent_sections = math.ceil((target_pixel_frames - 1) / frames_per_extension)
     total_latent_sections = int(max(total_latent_sections, 1))
 
-    job_id = generate_timestamp()
-    fps = mp4_fps
-
-    stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...'))))
+    status = 'ok'
+    save_thread = None
 
     try:
         if not high_vram:
             unload_complete_models(text_encoder, text_encoder_2, image_encoder, vae, transformer)
 
-        # Text encoding
-        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Text encoding ...'))))
-        if not high_vram:
-            fake_diffusers_current_device(text_encoder, gpu)
-            load_model_as_complete(text_encoder_2, target_device=gpu)
-
-        llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
-        if cfg == 1:
-            llama_vec_n, clip_l_pooler_n = torch.zeros_like(llama_vec), torch.zeros_like(clip_l_pooler)
-        else:
-            llama_vec_n, clip_l_pooler_n = encode_prompt_conds(n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
-
-        llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
-        llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
-
         # Image processing
-        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Image processing ...'))))
+        stream.output_queue.push(('progress', (None, desc_with(), make_progress_bar_html(0, 'Image processing ...'))))
         H, W, C = input_image.shape
         height, width = find_nearest_bucket(H, W, resolution=resolution)
         input_image_np = resize_and_center_crop(input_image, target_width=width, target_height=height)
-        Image.fromarray(input_image_np).save(os.path.join(outputs_folder, f'{job_id}.png'))
+        if not bulk_mode:
+            Image.fromarray(input_image_np).save(os.path.join(outputs_folder, f'{job_id}.png'))
         input_image_pt = torch.from_numpy(input_image_np).float() / 127.5 - 1
         input_image_pt = input_image_pt.permute(2, 0, 1)[None, :, None]
 
         # VAE encoding
-        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'VAE encoding ...'))))
+        stream.output_queue.push(('progress', (None, desc_with(), make_progress_bar_html(0, 'VAE encoding ...'))))
         if not high_vram:
             load_model_as_complete(vae, target_device=gpu)
         start_latent = vae_encode(input_image_pt, vae)
@@ -227,61 +340,22 @@ def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, 
         # VAE encoding for end image if provided
         end_latent = None
         if end_image is not None:
-            stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'VAE encoding end image ...'))))
+            stream.output_queue.push(('progress', (None, desc_with(), make_progress_bar_html(0, 'VAE encoding end image ...'))))
             end_image_np = resize_and_center_crop(end_image, target_width=width, target_height=height)
             end_image_pt = torch.from_numpy(end_image_np).float() / 127.5 - 1
             end_image_pt = end_image_pt.permute(2, 0, 1)[None, :, None]
             end_latent = vae_encode(end_image_pt, vae)
 
         # CLIP Vision
-        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'CLIP Vision encoding ...'))))
+        stream.output_queue.push(('progress', (None, desc_with(), make_progress_bar_html(0, 'CLIP Vision encoding ...'))))
         if not high_vram:
             load_model_as_complete(image_encoder, target_device=gpu)
         image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
-        image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
-
-        # Dtype Conversions
-        llama_vec = llama_vec.to(transformer_dtype)
-        llama_vec_n = llama_vec_n.to(transformer_dtype)
-        clip_l_pooler = clip_l_pooler.to(transformer_dtype)
-        clip_l_pooler_n = clip_l_pooler_n.to(transformer_dtype)
-        image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(transformer_dtype)
-
-        # Load transformer model
-        if model_changed:
-            stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Loading transformer ...'))))
-            transformer = None
-            time.sleep(1.0)
-            torch.cuda.empty_cache()
-            gc.collect()
-
-            transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePack_F1_I2V_HY_20250503', torch_dtype=torch.bfloat16).cpu()
-            transformer.eval()
-            transformer.high_quality_fp32_output_for_inference = True
-            transformer.to(dtype=torch.bfloat16)
-            transformer.requires_grad_(False)
-
-            if len(active_loras) > 0:
-                state_dict = transformer.state_dict()
-                for lora_path_or_url, multiplier in active_loras:
-                    local_path = download_lora(lora_path_or_url)
-                    if local_path:
-                        print(f"Merging LoRA file {os.path.basename(local_path)} with multiplier {multiplier}...")
-                        state_dict = merge_lora_to_state_dict(state_dict, local_path, multiplier, device=gpu)
-                        gc.collect()
-                info = transformer.load_state_dict(state_dict, strict=True, assign=True)
-                print(f"All LoRAs applied: {info}")
-
-            previous_lora_file = str(active_loras)
-            previous_lora_multiplier = lora_multiplier
-            if not high_vram:
-                DynamicSwapInstaller.install_model(transformer, device=gpu)
-            else:
-                transformer.to(gpu)
+        image_encoder_last_hidden_state = image_encoder_output.last_hidden_state.to(transformer_dtype)
 
         # Sampling Loop (Inverted/Backward Mode for End Frame Support)
-        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Start sampling ...'))))
-        
+        stream.output_queue.push(('progress', (None, desc_with(), make_progress_bar_html(0, 'Start sampling ...'))))
+
         if not high_vram:
             torch.cuda.empty_cache()
             gc.collect()
@@ -306,7 +380,8 @@ def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, 
             latent_padding_size = latent_padding * latent_window_size
 
             if stream.input_queue.top() == 'end':
-                return
+                status = 'aborted'
+                break
 
             print(f'latent_padding_size = {latent_padding_size}, is_last_section = {is_last_section}')
 
@@ -340,7 +415,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, 
                 percentage = int(100.0 * current_step / steps)
                 hint = f'Sampling {current_step}/{steps}'
                 px_count = int(max(0, total_generated_latent_frames * 4 - 3))
-                desc = f'Generated: {px_count} frames (~{px_count/mp4_fps:.1f}s). Expanding...'
+                desc = desc_with(f'Generated: {px_count} frames (~{px_count/mp4_fps:.1f}s). Expanding...')
                 stream.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, hint))))
 
             generated_latents = sample_hunyuan(
@@ -388,66 +463,156 @@ def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, 
                 unload_complete_models()
                 torch.cuda.empty_cache()
 
-            output_filename = os.path.join(outputs_folder, f'{job_id}_{total_generated_latent_frames}.mp4')
-            # Speedup: Save video asynchronously in a background thread
-            def async_save_video(px, path, fps, crf, stream_ptr):
-                save_bcthw_as_mp4(px, path, fps=fps, crf=crf)
-                stream_ptr.output_queue.push(('file', path))
-            
-            save_thread = threading.Thread(target=async_save_video, args=(history_pixels.clone(), output_filename, mp4_fps, mp4_crf, stream))
-            save_thread.start()
+            current_px_count = int(max(0, total_generated_latent_frames * 4 - 3))
+            is_final_section = is_last_section or current_px_count >= target_pixel_frames
+
+            # Bulk mode only writes the finished video, never the intermediate previews.
+            if is_final_section or not bulk_mode:
+                if bulk_mode:
+                    output_filename = os.path.join(outputs_folder, f'{job_id}.mp4')
+                else:
+                    output_filename = os.path.join(outputs_folder, f'{job_id}_{total_generated_latent_frames}.mp4')
+
+                # Speedup: Save video asynchronously in a background thread
+                def async_save_video(px, path, fps, crf, stream_ptr):
+                    save_bcthw_as_mp4(px, path, fps=fps, crf=crf)
+                    stream_ptr.output_queue.push(('file', path))
+
+                save_thread = threading.Thread(target=async_save_video, args=(history_pixels.clone(), output_filename, mp4_fps, mp4_crf, stream))
+                save_thread.start()
 
             if not high_vram:
                 gc.collect()
                 torch.cuda.empty_cache()
 
-            if is_last_section:
+            if is_final_section:
                 break
 
-            current_px_count = int(max(0, total_generated_latent_frames * 4 - 3))
-            if current_px_count >= target_pixel_frames:
+    except KeyboardInterrupt:
+        # Raised from the sampler callback when the user hits "End Generation".
+        print('Generation stopped by user.')
+        status = 'aborted'
+    except Exception:
+        traceback.print_exc()
+        status = 'error'
+        if not high_vram:
+            unload_complete_models(text_encoder, text_encoder_2, image_encoder, vae, transformer)
+    finally:
+        # Let the file land before the next job starts, so its 'file' signal is never lost.
+        if save_thread is not None:
+            save_thread.join()
+
+    return status
+
+
+@torch.no_grad()
+def worker(input_image, bulk_zip, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_fps, mp4_crf, resolution, lora_files, lora_links, lora_multiplier):
+    temp_dir = None
+
+    try:
+        # A ZIP switches on bulk mode: every image inside is generated one by one with the same settings.
+        bulk_mode = bool(bulk_zip)
+        if bulk_mode:
+            temp_dir = tempfile.mkdtemp(prefix='framepack_bulk_')
+            image_paths = extract_zip_images(bulk_zip, temp_dir)
+            if not image_paths:
+                stream.output_queue.push(('log', 'No images found in the ZIP file.'))
+                return
+            jobs = [(path, os.path.basename(path)) for path in image_paths]
+        else:
+            jobs = [(input_image, None)]
+
+        total_jobs = len(jobs)
+        batch_id = generate_timestamp()
+
+        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...'))))
+        if bulk_mode:
+            stream.output_queue.push(('log', f'Queued {total_jobs} image(s) from the ZIP file.'))
+
+        if not high_vram:
+            unload_complete_models(text_encoder, text_encoder_2, image_encoder, vae, transformer)
+
+        active_loras = collect_loras(lora_files, lora_links, lora_multiplier)
+        text_cond = encode_text(prompt, n_prompt, cfg)
+        ensure_transformer(active_loras, lora_multiplier)
+
+        for index, (item, name) in enumerate(jobs):
+            if stream.input_queue.top() == 'end':
                 break
+
+            if bulk_mode:
+                item_desc = f'**Video {index + 1}/{total_jobs}** — {name}'
+                job_id = f'{batch_id}_{index + 1:03d}_{sanitize_name(name)}'
+                try:
+                    image = load_image_as_numpy(item)
+                except Exception as e:
+                    print(f'Skipping unreadable image {name}: {e}')
+                    stream.output_queue.push(('log', f'Skipped {name} (could not be read)'))
+                    continue
+            else:
+                item_desc = ''
+                job_id = batch_id
+                image = item
+
+            status = generate_video(image, end_image, text_cond, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_fps, mp4_crf, resolution, job_id, bulk_mode=bulk_mode, item_desc=item_desc)
+
+            if status == 'aborted':
+                if bulk_mode:
+                    stream.output_queue.push(('log', f'Stopped at {index + 1}/{total_jobs} ({name}).'))
+                break
+
+            if bulk_mode:
+                if status == 'ok':
+                    stream.output_queue.push(('log', f'Finished {index + 1}/{total_jobs} — {job_id}.mp4'))
+                else:
+                    stream.output_queue.push(('log', f'Failed {index + 1}/{total_jobs} — {name} (see console)'))
 
     except Exception:
         traceback.print_exc()
         if not high_vram:
             unload_complete_models(text_encoder, text_encoder_2, image_encoder, vae, transformer)
     finally:
+        if temp_dir is not None:
+            shutil.rmtree(temp_dir, ignore_errors=True)
         # Guarantee termination signal to UI
         stream.output_queue.push(('end', None))
 
-def process(input_image, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_fps, mp4_crf, resolution, lora_files, lora_links, lora_multiplier):
+def process(input_image, bulk_zip, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_fps, mp4_crf, resolution, lora_files, lora_links, lora_multiplier):
     global stream
-    assert input_image is not None, 'No input image!'
-    yield None, None, '', '', gr.update(interactive=False), gr.update(interactive=True)
+    assert input_image is not None or bulk_zip, 'No input image! Upload a start image or a ZIP of images.'
+    yield None, None, '', '', '', gr.update(interactive=False), gr.update(interactive=True)
     stream = AsyncStream()
-    async_run(worker, input_image, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_fps, mp4_crf, resolution, lora_files, lora_links, lora_multiplier)
-    
+    async_run(worker, input_image, bulk_zip, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_fps, mp4_crf, resolution, lora_files, lora_links, lora_multiplier)
+
     try:
         output_filename = None
+        log_lines = []
         while True:
             if stream is None:
                 break
-            
+
             res = stream.output_queue.pop()
             if res is None:
                 time.sleep(0.01)
                 continue
-            
+
             signal, data = res
             if signal == 'file':
                 output_filename = data
-                yield output_filename, gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+                yield output_filename, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
             if signal == 'progress':
                 preview, desc, bar = data
-                yield gr.update(), preview if preview is not None else gr.update(), desc, bar, gr.update(), gr.update()
+                yield gr.update(), preview if preview is not None else gr.update(), desc, bar, gr.update(), gr.update(), gr.update()
+            if signal == 'log':
+                log_lines.append(data)
+                yield gr.update(), gr.update(), gr.update(), gr.update(), '\n'.join(f'- {line}' for line in log_lines), gr.update(), gr.update()
             if signal == 'end':
                 break
     except Exception as e:
         print(f"UI Loop Error: {e}")
         traceback.print_exc()
     finally:
-        yield gr.update(), gr.update(), 'Done.', '', gr.update(interactive=True), gr.update(interactive=False)
+        yield gr.update(), gr.update(), 'Done.', '', gr.update(), gr.update(interactive=True), gr.update(interactive=False)
 
 def end_process():
     stream.input_queue.push('end')
@@ -462,6 +627,8 @@ with block:
             with gr.Row():
                 input_image = gr.Image(sources='upload', type="numpy", label="Start Image", height=320)
                 end_image = gr.Image(sources='upload', type="numpy", label="End Image (Optional)", height=320)
+            bulk_zip = gr.File(label="Bulk Images (ZIP, Optional)", file_count="single", file_types=[".zip"], type="filepath")
+            gr.Markdown('Upload a ZIP of images to run them one by one with the same prompt and settings. In bulk mode the Start Image is ignored (the End Image, if set, still applies to every video) and only each finished video is written to the output folder — no intermediate previews.')
             resolution = gr.Slider(label="Resolution", minimum=240, maximum=720, value=416, step=16)
             prompt = gr.Textbox(label="Prompt", value='')
             example_quick_prompts = gr.Dataset(samples=quick_prompts, label='Quick List', components=[prompt])
@@ -497,9 +664,10 @@ with block:
             gr.Markdown('Note that the ending actions will be generated before the starting actions due to the inverted sampling. If the starting action is not in the video, you just need to wait, and it will be generated later.')
             progress_desc = gr.Markdown('Ready.')
             progress_bar = gr.HTML('')
+            batch_log = gr.Markdown('')
 
-    ips = [input_image, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_fps, mp4_crf, resolution, lora_files, lora_links, lora_multiplier]
-    start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
+    ips = [input_image, bulk_zip, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_fps, mp4_crf, resolution, lora_files, lora_links, lora_multiplier]
+    start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, batch_log, start_button, end_button])
     end_button.click(fn=end_process)
 
 block.launch(server_name=args.server, server_port=args.port, share=args.share, inbrowser=args.inbrowser, allowed_paths=[outputs_folder])
