@@ -13,6 +13,7 @@ import argparse
 import math
 import gc
 import time
+import difflib
 import re
 import shutil
 import tempfile
@@ -202,6 +203,51 @@ def extract_zip_images(zip_path, dest_dir):
 def load_image_as_numpy(path):
     with Image.open(path) as img:
         return np.array(img.convert('RGB'))
+
+
+# Words that only say which end of a pair an image is, so they are ignored when matching names.
+PAIR_MARKERS = frozenset((
+    'start', 'starting', 'begin', 'beginning', 'first', 'src', 'source', 'input',
+    'end', 'ending', 'finish', 'final', 'last', 'dst', 'dest', 'destination', 'target', 'output',
+))
+
+
+def match_key(name):
+    """Normalized name used to pair start/end images: drops pair markers and zero padding."""
+    stem = os.path.splitext(os.path.basename(name))[0].lower()
+    tokens = re.findall(r'[a-z]+|\d+', stem)
+    normalized = [str(int(t)) if t.isdigit() else t for t in tokens]
+    kept = [t for t in normalized if t not in PAIR_MARKERS]
+    return '_'.join(kept or normalized)
+
+
+def pair_images_by_name(start_paths, end_paths):
+    """Pairs every start image with the closest-named end image, one end image per start.
+
+    Pairs are assigned best score first, so confident name matches win before the leftovers.
+    Names with nothing in common all score alike and, because the sort is stable, fall back to
+    the order the images appear in their archives.
+    """
+    pairs = {path: None for path in start_paths}
+    if not end_paths:
+        return pairs
+
+    keys = {path: match_key(path) for path in start_paths + end_paths}
+    scored = []
+    for start_path in start_paths:
+        for end_path in end_paths:
+            ratio = difflib.SequenceMatcher(None, keys[start_path], keys[end_path]).ratio()
+            scored.append((ratio, start_path, end_path))
+    scored.sort(key=lambda item: -item[0])
+
+    matched_ends = set()
+    for _, start_path, end_path in scored:
+        if pairs[start_path] is not None or end_path in matched_ends:
+            continue
+        pairs[start_path] = end_path
+        matched_ends.add(end_path)
+
+    return pairs
 
 
 def collect_loras(lora_files, lora_links, lora_multiplier):
@@ -506,28 +552,47 @@ def generate_video(input_image, end_image, text_cond, seed, total_second_length,
 
 
 @torch.no_grad()
-def worker(input_image, bulk_zip, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_fps, mp4_crf, resolution, lora_files, lora_links, lora_multiplier):
+def worker(input_image, bulk_start_zip, bulk_end_zip, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_fps, mp4_crf, resolution, lora_files, lora_links, lora_multiplier):
     temp_dir = None
 
     try:
-        # A ZIP switches on bulk mode: every image inside is generated one by one with the same settings.
-        bulk_mode = bool(bulk_zip)
+        # A start ZIP switches on bulk mode: every image inside is generated one by one with the same settings.
+        bulk_mode = bool(bulk_start_zip)
+        matched_count = 0
         if bulk_mode:
             temp_dir = tempfile.mkdtemp(prefix='framepack_bulk_')
-            image_paths = extract_zip_images(bulk_zip, temp_dir)
-            if not image_paths:
-                stream.output_queue.push(('log', 'No images found in the ZIP file.'))
+            start_dir = os.path.join(temp_dir, 'start')
+            end_dir = os.path.join(temp_dir, 'end')
+            os.makedirs(start_dir)
+            os.makedirs(end_dir)
+
+            start_paths = extract_zip_images(bulk_start_zip, start_dir)
+            if not start_paths:
+                stream.output_queue.push(('log', 'No images found in the Bulk Start ZIP.'))
                 return
-            jobs = [(path, os.path.basename(path)) for path in image_paths]
+
+            end_paths = extract_zip_images(bulk_end_zip, end_dir) if bulk_end_zip else []
+            if bulk_end_zip and not end_paths:
+                stream.output_queue.push(('log', 'No images found in the Bulk End ZIP.'))
+
+            pairs = pair_images_by_name(start_paths, end_paths)
+            matched_count = sum(1 for path in start_paths if pairs[path] is not None)
+            for path in start_paths:
+                partner = pairs[path]
+                print(f'Pairing {os.path.basename(path)} -> {os.path.basename(partner) if partner else "(no end frame)"}')
+
+            jobs = [(path, os.path.basename(path), pairs[path]) for path in start_paths]
         else:
-            jobs = [(input_image, None)]
+            jobs = [(input_image, None, None)]
 
         total_jobs = len(jobs)
         batch_id = generate_timestamp()
 
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...'))))
         if bulk_mode:
-            stream.output_queue.push(('log', f'Queued {total_jobs} image(s) from the ZIP file.'))
+            stream.output_queue.push(('log', f'Queued {total_jobs} start image(s) from the ZIP file.'))
+            if end_paths:
+                stream.output_queue.push(('log', f'Matched {matched_count}/{total_jobs} start image(s) to an end frame by name.'))
 
         if not high_vram:
             unload_complete_models(text_encoder, text_encoder_2, image_encoder, vae, transformer)
@@ -536,12 +601,14 @@ def worker(input_image, bulk_zip, end_image, prompt, n_prompt, seed, total_secon
         text_cond = encode_text(prompt, n_prompt, cfg)
         ensure_transformer(active_loras, lora_multiplier)
 
-        for index, (item, name) in enumerate(jobs):
+        for index, (item, name, end_path) in enumerate(jobs):
             if stream.input_queue.top() == 'end':
                 break
 
+            # Unpaired start images fall back to the single End Image field, which may be None.
+            item_end_image = end_image
+
             if bulk_mode:
-                item_desc = f'**Video {index + 1}/{total_jobs}** — {name}'
                 job_id = f'{batch_id}_{index + 1:03d}_{sanitize_name(name)}'
                 try:
                     image = load_image_as_numpy(item)
@@ -549,12 +616,22 @@ def worker(input_image, bulk_zip, end_image, prompt, n_prompt, seed, total_secon
                     print(f'Skipping unreadable image {name}: {e}')
                     stream.output_queue.push(('log', f'Skipped {name} (could not be read)'))
                     continue
+
+                pair_label = name
+                if end_path is not None:
+                    try:
+                        item_end_image = load_image_as_numpy(end_path)
+                        pair_label = f'{name} → {os.path.basename(end_path)}'
+                    except Exception as e:
+                        print(f'Could not read end frame {os.path.basename(end_path)}: {e}')
+                        stream.output_queue.push(('log', f'End frame {os.path.basename(end_path)} could not be read — generating {name} without it'))
+                item_desc = f'**Video {index + 1}/{total_jobs}** — {pair_label}'
             else:
                 item_desc = ''
                 job_id = batch_id
                 image = item
 
-            status = generate_video(image, end_image, text_cond, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_fps, mp4_crf, resolution, job_id, bulk_mode=bulk_mode, item_desc=item_desc)
+            status = generate_video(image, item_end_image, text_cond, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_fps, mp4_crf, resolution, job_id, bulk_mode=bulk_mode, item_desc=item_desc)
 
             if status == 'aborted':
                 if bulk_mode:
@@ -577,12 +654,13 @@ def worker(input_image, bulk_zip, end_image, prompt, n_prompt, seed, total_secon
         # Guarantee termination signal to UI
         stream.output_queue.push(('end', None))
 
-def process(input_image, bulk_zip, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_fps, mp4_crf, resolution, lora_files, lora_links, lora_multiplier):
+def process(input_image, bulk_start_zip, bulk_end_zip, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_fps, mp4_crf, resolution, lora_files, lora_links, lora_multiplier):
     global stream
-    assert input_image is not None or bulk_zip, 'No input image! Upload a start image or a ZIP of images.'
+    assert input_image is not None or bulk_start_zip, 'No input image! Upload a start image or a Bulk Start ZIP.'
+    assert bulk_start_zip or not bulk_end_zip, 'A Bulk End ZIP needs a Bulk Start ZIP to pair its images with.'
     yield None, None, '', '', '', gr.update(interactive=False), gr.update(interactive=True)
     stream = AsyncStream()
-    async_run(worker, input_image, bulk_zip, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_fps, mp4_crf, resolution, lora_files, lora_links, lora_multiplier)
+    async_run(worker, input_image, bulk_start_zip, bulk_end_zip, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_fps, mp4_crf, resolution, lora_files, lora_links, lora_multiplier)
 
     try:
         output_filename = None
@@ -627,8 +705,10 @@ with block:
             with gr.Row():
                 input_image = gr.Image(sources='upload', type="numpy", label="Start Image", height=320)
                 end_image = gr.Image(sources='upload', type="numpy", label="End Image (Optional)", height=320)
-            bulk_zip = gr.File(label="Bulk Images (ZIP, Optional)", file_count="single", file_types=[".zip"], type="filepath")
-            gr.Markdown('Upload a ZIP of images to run them one by one with the same prompt and settings. In bulk mode the Start Image is ignored (the End Image, if set, still applies to every video) and only each finished video is written to the output folder — no intermediate previews.')
+            with gr.Row():
+                bulk_start_zip = gr.File(label="Bulk Start Images (ZIP, Optional)", file_count="single", file_types=[".zip"], type="filepath")
+                bulk_end_zip = gr.File(label="Bulk End Images (ZIP, Optional)", file_count="single", file_types=[".zip"], type="filepath")
+            gr.Markdown('Upload a ZIP of start images to run them one by one with the same prompt and settings. Add a second ZIP to give each video its own end frame: images are paired by closest file name (`shot3_start.png` → `shot3_end.png`), and any start image left without a partner falls back to the End Image above. In bulk mode the Start Image is ignored and only each finished video is written to the output folder — no intermediate previews.')
             resolution = gr.Slider(label="Resolution", minimum=240, maximum=720, value=416, step=16)
             prompt = gr.Textbox(label="Prompt", value='')
             example_quick_prompts = gr.Dataset(samples=quick_prompts, label='Quick List', components=[prompt])
@@ -666,7 +746,7 @@ with block:
             progress_bar = gr.HTML('')
             batch_log = gr.Markdown('')
 
-    ips = [input_image, bulk_zip, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_fps, mp4_crf, resolution, lora_files, lora_links, lora_multiplier]
+    ips = [input_image, bulk_start_zip, bulk_end_zip, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_fps, mp4_crf, resolution, lora_files, lora_links, lora_multiplier]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, batch_log, start_button, end_button])
     end_button.click(fn=end_process)
 
