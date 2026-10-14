@@ -4,6 +4,13 @@
 
 # FramePack
 
+> **This fork: start frame → AI end frame → video pipeline.** Open [`colab/pipeline.ipynb`](https://colab.research.google.com/github/kdeary/FramePack/blob/pipeline/colab/pipeline.ipynb) in Colab and run its single cell. In the app, upload start frames (several images or a ZIP) and write one **end-frame prompt**. [Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511) (4-step Lightning, run headless in ComfyUI) turns every start frame into its end frame. You can review and re-roll them, then FramePack makes one video per pair. Each batch is saved to Drive with a `manifest.json` and can be resumed after a disconnect.
+>
+> - `pipeline/batch_store.py`: batch folders, start/end pairing by file name, resume.
+> - `pipeline/comfy_runner.py`: ComfyUI subprocess + HTTP API. Swap the edit model by pointing `--edit_workflow` at another API-format workflow whose nodes are titled `IN_IMAGE`, `IN_PROMPT`, `IN_SEED` and `OUT_IMAGE`.
+> - `colab/setup.sh`: creates two uv venvs and downloads every model in parallel.
+> - Tests: `python -m unittest discover tests` (no GPU needed).
+
 Official implementation and desktop software for ["Frame Context Packing and Drift Prevention in Next-Frame-Prediction Video Diffusion Models"](https://lllyasviel.github.io/frame_pack_gitpage/).
 
 Links: [**Paper**](https://arxiv.org/abs/2504.12626), [**Project Page**](https://lllyasviel.github.io/frame_pack_gitpage/)
